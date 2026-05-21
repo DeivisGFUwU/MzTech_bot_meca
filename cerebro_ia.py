@@ -32,7 +32,7 @@ def configurar_y_generar(api_key, texto_boss):
     
     # Ejecutamos la inferencia con la nueva estructura de configuración
     respuesta = cliente.models.generate_content(
-        model='gemini-1.5-flash',
+        model='gemini 3.1 flash lite',
         contents=prompt_sistema + texto_boss,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
