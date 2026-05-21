@@ -4,7 +4,8 @@ from flask import Flask, request, jsonify
 from supabase import create_client, Client
 import requests
 from dotenv import load_dotenv
-from cerebro_ia import procesar_promo_boss
+from cerebro_ia import procesar_promo_boss, generar_respuesta_rescate, generar_respuesta_ventas
+import time # ¡Asegúrate de tener este import arriba en app.py!
 
 # Ignición del Entorno
 load_dotenv()
@@ -61,13 +62,23 @@ def webhook_whatsapp():
         return jsonify({"status": "ok"}), 200
 
 # ==========================================
-# FUNCIONES DE TRANSMISIÓN (BRAZOS ROBÓTICOS)
+# FUNCIONES DE TRANSMISIÓN (BRAZOS ROBÓTICOS BLINDADOS)
 # ==========================================
 def enviar_mensaje(numero_destino, texto):
     url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": numero_destino, "type": "text", "text": {"body": texto}}
-    requests.post(url, headers=headers, json=payload)
+    
+    for intento in range(3):
+        try:
+            # Timeout de 5 segundos para que el hilo no se quede congelado
+            respuesta = requests.post(url, headers=headers, json=payload, timeout=5)
+            if respuesta.status_code == 200:
+                return True
+        except Exception as e:
+            print(f"⚠️ [RED META] Pérdida de paquetes en mensaje (Intento {intento+1}): {e}")
+            time.sleep(1)
+    return False
 
 def reenviar_imagen(numero_destino, image_id, caption):
     url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
@@ -76,7 +87,16 @@ def reenviar_imagen(numero_destino, image_id, caption):
         "messaging_product": "whatsapp", "to": numero_destino, "type": "image",
         "image": {"id": image_id, "caption": caption}
     }
-    requests.post(url, headers=headers, json=payload)
+    
+    for intento in range(3):
+        try:
+            respuesta = requests.post(url, headers=headers, json=payload, timeout=5)
+            if respuesta.status_code == 200:
+                return True
+        except Exception as e:
+            print(f"⚠️ [RED META] Pérdida de paquetes en imagen (Intento {intento+1}): {e}")
+            time.sleep(1)
+    return False
 
 # ==========================================
 # EL NÚCLEO LÓGICO
@@ -177,13 +197,14 @@ def enrutador_mecanico(numero_origen, mensaje_info, cambios):
         return
 
     # ---------------------------------------------------------
-    # VÁLVULA DEL CLIENTE (EMBUDO CRM)
+    # VÁLVULA DEL CLIENTE (EMBUDO CRM HÍBRIDO)
     # ---------------------------------------------------------
     if numero_origen != NUMERO_JEFE:
         cliente_db = supabase.table('clientes').select('*').eq('phone', numero_origen).execute()
         
+        # 1. Registro inicial / Cliente Nuevo (Fase 1)
         if not cliente_db.data:
-            supabase.table('clientes').insert({'phone': numero_origen, 'name': nombre_usuario, 'fase_actual': 2}).execute()
+            supabase.table('clientes').insert({'phone': numero_origen, 'name': nombre_usuario, 'fase_actual': 1}).execute()
             
             msg_bienvenida = (
                 f"¡Hola {nombre_usuario}! 👋 Bienvenido/a a {DATOS_EMPRESA['nombre_empresa']}.\n"
@@ -197,37 +218,52 @@ def enrutador_mecanico(numero_origen, mensaje_info, cambios):
             fase = cliente_db.data[0]['fase_actual']
             supabase.table('clientes').update({'ultimo_mensaje_at': 'now()'}).eq('phone', numero_origen).execute()
 
-            palabras_interes = ["hola", "info", "precio", "facebook", "tiktok", "interesa", "audifonos", "airpods"]
-            
-            if fase == 2 and any(palabra in texto_lower for palabra in palabras_interes):
-                promo_activa = supabase.table('campaigns').select('datos_estructurados').eq('is_active', True).execute()
+            # 2. La Transacción Estricta (Mecánica Pura)
+            if texto_lower.startswith("comprar "):
+                try:
+                    articulo = texto_lower.replace("comprar ", "").strip()
+                    token = numero_origen[-4:]
+                    
+                    supabase.table('orders').insert({
+                        "customer_phone": numero_origen, 
+                        "product_name": articulo, 
+                        "token_aprobacion": token
+                    }).execute()
+                    
+                    enviar_mensaje(numero_origen, f"📦 Separando tu: *{articulo}*.\nPor favor, Yapea al 999-999-999 y envíanos la *foto de la captura* por aquí para validar.")
+                    enviar_mensaje(NUMERO_JEFE, f"🔔 [NUEVA ORDEN - ESPERANDO PAGO]\nCliente: {nombre_usuario}\nProducto: {articulo}\nToken de validación: {token}")
+                
+                except Exception as e:
+                    print(f"❌ [ERROR FATAL DE TRANSACCIÓN]: {e}")
+                    enviar_mensaje(numero_origen, "⚠️ Ocurrió una anomalía temporal en la matriz de pedidos. ¡Por favor, intenta escribir tu pedido una vez más!")
+
+            # 3. El Córtex de Ventas Persuasivo (LLM + JSON)
+            else:
+                promo_activa = supabase.table('campaigns').select('*').eq('is_active', True).execute()
                 
                 if promo_activa.data:
-                    datos = promo_activa.data[0]['datos_estructurados']
-                    msg_valor = (
-                        f"🎧 {datos['nombre_producto']} — Lo que los hace únicos:\n"
-                        + "\n".join([f"✅ {c}" for c in datos['caracteristicas']]) + "\n\n"
-                        f"💸 Precio regular: S/ {datos['precio_regular']}\n"
-                        f"🏷️ Precio especial HOY: S/ {datos['precio_oferta']} 🔥\n\n"
-                        f"⚠️ Stock limitado. ¿Te lo separamos? Escribe *'comprar {datos['nombre_producto']}'*."
-                    )
-                    supabase.table('clientes').update({'fase_actual': 3}).eq('phone', numero_origen).execute()
-                    enviar_mensaje(numero_origen, msg_valor)
+                    datos_producto = promo_activa.data[0]['datos_estructurados']
+                    nombre_prod = promo_activa.data[0]['nombre_producto']
+                    
+                    # Invocamos el cerebro de ventas persuasivo para analizar el contexto
+                    respuesta_ia = generar_respuesta_ventas(texto_recibido, fase, datos_producto, nombre_prod)
+                    
+                    if respuesta_ia:
+                        nueva_fase = respuesta_ia.get("fase_siguiente", fase)
+                        mensaje_ia = respuesta_ia.get("mensaje_convincente", "¡Hola! ¿En qué te puedo ayudar hoy?")
+                        
+                        # Guardamos el avance del estado del cliente en el CRM
+                        supabase.table('clientes').update({'fase_actual': nueva_fase}).eq('phone', numero_origen).execute()
+                        
+                        # El bot ejecuta el mensaje persuasivo cargado de emojis
+                        enviar_mensaje(numero_origen, mensaje_ia)
+                    else:
+                        # Red de Seguridad de Rescate si la inferencia JSON falla
+                        enviar_mensaje(numero_origen, generar_respuesta_rescate(texto_recibido))
                 else:
                     enviar_mensaje(numero_origen, "En este momento estamos actualizando nuestro catálogo. ¡Vuelve en unos minutos!")
                     
-            elif texto_lower.startswith("comprar "):
-                articulo = texto_lower.replace("comprar ", "").strip()
-                token = numero_origen[-4:]
                 
-                supabase.table('orders').insert({
-                    "customer_phone": numero_origen, 
-                    "product_name": articulo, 
-                    "token_aprobacion": token
-                }).execute()
                 
-                enviar_mensaje(numero_origen, f"📦 Separando tu: *{articulo}*.\nPor favor, Yapea al 999-999-999 y envíanos la *foto de la captura* por aquí para validar.")
-                enviar_mensaje(NUMERO_JEFE, f"🔔 [NUEVA ORDEN - ESPERANDO PAGO]\nCliente: {nombre_usuario}\nProducto: {articulo}\nToken de validación: {token}")
-
 if __name__ == '__main__':
     app.run(port=5000)
