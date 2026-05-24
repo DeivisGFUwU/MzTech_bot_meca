@@ -1,11 +1,29 @@
 import os
+import json
 import threading
+import time
+from datetime import datetime, timedelta, timezone
+import logging
+import hmac
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
 from flask import Flask, request, jsonify
 from supabase import create_client, Client
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 from dotenv import load_dotenv
-from cerebro_ia import procesar_promo_boss, generar_respuesta_rescate, generar_respuesta_ventas
-import time # ¡Asegúrate de tener este import arriba en app.py!
+# [NUEVO] Importamos la nueva función de seguimiento
+from cerebro_ia import procesar_promo_boss, generar_respuesta_rescate, generar_respuesta_ventas, generar_respuesta_seguimiento
+
+# Configuración de Logging de producción
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] (%(filename)s:%(lineno)d) - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("BotMecanico")
 
 # Ignición del Entorno
 load_dotenv()
@@ -16,6 +34,60 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 NUMERO_JEFE = os.getenv("NUMERO_JEFE")
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET") # Secreto de la aplicación Meta para validar firmas
+
+# Configuración del Pool de Conexiones HTTP para evitar saturación de sockets
+http_session = requests.Session()
+retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+http_session.mount("https://", HTTPAdapter(pool_connections=20, pool_maxsize=40, max_retries=retries))
+
+# Pool de Hilos para procesar webhooks de manera controlada (evita DoS por saturación de hilos)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
+webhook_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+# Limitadores de Tasa (Rate Limiters) en memoria y thread-safe
+class InMemoryRateLimiter:
+    def __init__(self, requests_limit, period_seconds):
+        self.limit = requests_limit
+        self.period = period_seconds
+        self.history = defaultdict(list)
+        self.lock = threading.Lock()
+
+    def is_allowed(self, key):
+        now = time.time()
+        with self.lock:
+            # Filtrar accesos fuera del período actual
+            self.history[key] = [t for t in self.history[key] if now - t < self.period]
+            if len(self.history[key]) < self.limit:
+                self.history[key].append(now)
+                return True
+            return False
+
+# Limitar por IP de origen (ej: 60 peticiones por minuto)
+ip_rate_limiter = InMemoryRateLimiter(requests_limit=60, period_seconds=60)
+# Limitar por número de WhatsApp de origen (ej: 10 mensajes por minuto) para evitar spam a la IA
+wa_rate_limiter = InMemoryRateLimiter(requests_limit=10, period_seconds=60)
+
+def verificar_firma_whatsapp(payload_bytes, signature_header):
+    """Verifica criptográficamente que el webhook provenga de Meta utilizando el App Secret."""
+    if not WHATSAPP_APP_SECRET:
+        logger.warning("🔒 [SEGURIDAD] WHATSAPP_APP_SECRET no está configurado. Omisión temporal de validación de firma.")
+        return True
+    if not signature_header:
+        logger.error("🔒 [SEGURIDAD] Cabecera X-Hub-Signature-256 ausente.")
+        return False
+    if not signature_header.startswith("sha256="):
+        logger.error("🔒 [SEGURIDAD] Cabecera X-Hub-Signature-256 tiene formato inválido.")
+        return False
+    
+    signature = signature_header[7:]
+    expected_signature = hmac.new(
+        WHATSAPP_APP_SECRET.encode('utf-8'),
+        payload_bytes,
+        hashlib.sha256
+    ).hexdigest()
+    
+    return hmac.compare_digest(signature, expected_signature)
 
 # Conexión a la Matriz de Datos
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
@@ -25,16 +97,73 @@ try:
     auth_data = supabase.table('config_empresa').select('*').eq('ruc', '20610576002').execute()
     DATOS_EMPRESA = auth_data.data[0]
 except Exception as e:
-    print(f"⚠️ [ALERTA] Fallo al extraer datos de autoridad: {e}")
+    logger.error(f"⚠️ [ALERTA] Fallo al extraer datos de autoridad de Supabase: {e}")
     DATOS_EMPRESA = {"nombre_empresa": "MzTech", "web_url": "https://manzanotech.com/", "ruc": "20610576002", "fecha_fundacion": "2023-02-20"}
+
+# ==========================================
+# [NUEVO] EL RELOJ CUÁNTICO (MOTOR ASÍNCRONO)
+# ==========================================
+def motor_seguimiento_asincrono():
+    """Hilo infinito que vigila a los clientes inactivos y dispara el retargeting."""
+    while True:
+        try:
+            ahora = datetime.now(timezone.utc).isoformat()
+            # Buscamos tareas programadas para AHORA o ANTES, que no hayan sido procesadas
+            tareas = supabase.table('cola_mensajes').select('*').eq('is_processed', False).lte('ejecutar_en', ahora).execute()
+            
+            for tarea in tareas.data:
+                telefono = tarea['customer_phone']
+                fase = tarea['fase_programada']
+                id_tarea = tarea['id']
+                
+                # Bloqueo Optimista: Intentamos marcarla como procesada de forma atómica antes de actuar.
+                # Si ya fue procesada por otra instancia/hilo, la consulta no devolverá datos de fila modificada.
+                try:
+                    bloqueo = supabase.table('cola_mensajes').update({'is_processed': True}).eq('id', id_tarea).eq('is_processed', False).execute()
+                    if not bloqueo.data:
+                        logger.info(f"⏭️ [RELOJ CUÁNTICO] Tarea {id_tarea} ya fue procesada por otro hilo. Saltando.")
+                        continue
+                except Exception as e:
+                    logger.error(f"⚠️ [RELOJ CUÁNTICO] Error al intentar bloquear la tarea {id_tarea}: {e}")
+                    continue
+                
+                # 1. Extraemos el catálogo activo para que la IA sepa qué ofrecer
+                catalogo = supabase.table('campaigns').select('nombre_producto').eq('is_active', True).execute()
+                nombres_activos = [prod['nombre_producto'] for prod in catalogo.data] if catalogo.data else "nuestro catálogo completo"
+                
+                # 2. Despertamos al Córtex para redactar el enganche
+                mensaje_retargeting = generar_respuesta_seguimiento(fase, nombres_activos)
+                
+                if mensaje_retargeting:
+                    enviar_mensaje(telefono, mensaje_retargeting)
+                    logger.info(f"🎯 [RETARGETING] Mensaje asíncrono enviado a {telefono}")
+                
+        except Exception as e:
+            logger.error(f"⚠️ [RELOJ CUÁNTICO] Interferencia en el motor asíncrono: {e}")
+            
+        # El reloj duerme 60 segundos antes de volver a escanear la base de datos
+        time.sleep(60)
+
+# Encendemos el motor asíncrono en segundo plano al arrancar el servidor
+hilo_reloj = threading.Thread(target=motor_seguimiento_asincrono, daemon=True)
+hilo_reloj.start()
+
 
 # ==========================================
 # VÁLVULA DE SUPERVIVENCIA (UPTIMEROBOT)
 # ==========================================
 @app.route('/ping', methods=['GET'])
 def mantener_vivo():
-    supabase.table('campaigns').select('id').limit(1).execute()
-    return "¡Reactor LarvaDev latiendo a 120 BPM!", 200
+    ip_cliente = request.remote_addr or "unknown_ip"
+    if not ip_rate_limiter.is_allowed(ip_cliente):
+        logger.warning(f"🚫 [RATE LIMIT] Peticiones IP excedidas para ping: {ip_cliente}")
+        return jsonify({"error": "Demasiadas peticiones"}), 429
+    try:
+        supabase.table('campaigns').select('id').limit(1).execute()
+        return "¡Reactor LarvaDev latiendo a 120 BPM!", 200
+    except Exception as e:
+        logger.error(f"⚠️ [PING ERROR] Error al interactuar con base de datos: {e}")
+        return "¡Reactor LarvaDev experimentando fallos de red!", 500
 
 # ==========================================
 # COMPUERTA DE TELEMETRÍA (META WEBHOOK)
@@ -47,18 +176,49 @@ def webhook_whatsapp():
         return "Acceso denegado", 403
 
     if request.method == 'POST':
-        data = request.get_json()
+        ip_cliente = request.remote_addr or "unknown_ip"
+        
+        # 1. IP Rate Limiter
+        if not ip_rate_limiter.is_allowed(ip_cliente):
+            logger.warning(f"🚫 [RATE LIMIT] IP bloqueada temporalmente: {ip_cliente}")
+            return jsonify({"error": "Demasiadas peticiones"}), 429
+        
+        # 2. Verificación de Firma HMAC
+        raw_payload = request.get_data()
+        signature = request.headers.get("X-Hub-Signature-256")
+        if not verificar_firma_whatsapp(raw_payload, signature):
+            logger.warning(f"🔒 [SEGURIDAD] Firma de webhook inválida desde la IP: {ip_cliente}")
+            return jsonify({"error": "Acceso denegado. Firma inválida."}), 401
+        
+        # 3. Parsear JSON de forma segura
         try:
-            cambios = data['entry'][0]['changes'][0]['value']
-            if 'messages' in cambios:
-                mensaje_info = cambios['messages'][0]
-                numero_origen = mensaje_info['from']
-                
-                # Despachador Asíncrono para evitar colapso térmico por Timeout
-                hilo = threading.Thread(target=enrutador_mecanico, args=(numero_origen, mensaje_info, cambios))
-                hilo.start()
+            data = json.loads(raw_payload.decode('utf-8'))
         except Exception as e:
-            pass
+            logger.error(f"⚠️ [JSON ERROR] Error de parseo en webhook desde IP {ip_cliente}: {e}")
+            return jsonify({"error": "JSON malformado"}), 400
+            
+        try:
+            entry = data.get('entry')
+            if entry and len(entry) > 0:
+                changes = entry[0].get('changes')
+                if changes and len(changes) > 0:
+                    cambios = changes[0].get('value', {})
+                    messages = cambios.get('messages')
+                    if messages and len(messages) > 0:
+                        mensaje_info = messages[0]
+                        numero_origen = mensaje_info.get('from')
+                        
+                        if numero_origen:
+                            # 4. WhatsApp Rate Limiter (limita spam de un usuario específico)
+                            if not wa_rate_limiter.is_allowed(numero_origen):
+                                logger.warning(f"🚫 [RATE LIMIT] Mensajes de WhatsApp excedidos para {numero_origen}. Ignorando.")
+                                return jsonify({"status": "rate_limited"}), 200
+                            
+                            # 5. Encolar tarea en ThreadPoolExecutor para evitar DoS por saturación de hilos
+                            webhook_executor.submit(enrutador_mecanico, numero_origen, mensaje_info, cambios)
+        except Exception as e:
+            logger.error(f"⚠️ [WEBHOOK ERROR] Excepción al procesar webhook: {e}", exc_info=True)
+            
         return jsonify({"status": "ok"}), 200
 
 # ==========================================
@@ -69,15 +229,13 @@ def enviar_mensaje(numero_destino, texto):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": numero_destino, "type": "text", "text": {"body": texto}}
     
-    for intento in range(3):
-        try:
-            # Timeout de 5 segundos para que el hilo no se quede congelado
-            respuesta = requests.post(url, headers=headers, json=payload, timeout=5)
-            if respuesta.status_code == 200:
-                return True
-        except Exception as e:
-            print(f"⚠️ [RED META] Pérdida de paquetes en mensaje (Intento {intento+1}): {e}")
-            time.sleep(1)
+    try:
+        respuesta = http_session.post(url, headers=headers, json=payload, timeout=5)
+        if respuesta.status_code == 200:
+            return True
+        logger.error(f"❌ [WHATSAPP API] Error al enviar mensaje: {respuesta.status_code} - {respuesta.text}")
+    except Exception as e:
+        logger.error(f"❌ [WHATSAPP API] Excepción al enviar mensaje a {numero_destino}: {e}")
     return False
 
 def reenviar_imagen(numero_destino, image_id, caption):
@@ -88,182 +246,183 @@ def reenviar_imagen(numero_destino, image_id, caption):
         "image": {"id": image_id, "caption": caption}
     }
     
-    for intento in range(3):
-        try:
-            respuesta = requests.post(url, headers=headers, json=payload, timeout=5)
-            if respuesta.status_code == 200:
-                return True
-        except Exception as e:
-            print(f"⚠️ [RED META] Pérdida de paquetes en imagen (Intento {intento+1}): {e}")
-            time.sleep(1)
+    try:
+        respuesta = http_session.post(url, headers=headers, json=payload, timeout=5)
+        if respuesta.status_code == 200:
+            return True
+        logger.error(f"❌ [WHATSAPP API] Error al reenviar imagen: {respuesta.status_code} - {respuesta.text}")
+    except Exception as e:
+        logger.error(f"❌ [WHATSAPP API] Excepción al reenviar imagen a {numero_destino}: {e}")
     return False
 
 # ==========================================
 # EL NÚCLEO LÓGICO
 # ==========================================
 def enrutador_mecanico(numero_origen, mensaje_info, cambios):
-    tipo_mensaje = mensaje_info.get('type')
-    nombre_usuario = cambios['contacts'][0]['profile']['name']
-
-    # ---------------------------------------------------------
-    # RADAR DE VOUCHERS (IMÁGENES) - ¡AQUÍ ESTÁ LA PARTE 4!
-    # ---------------------------------------------------------
-    if tipo_mensaje == 'image':
-        image_id = mensaje_info['image']['id']
-        enviar_mensaje(numero_origen, "¡Comprobante detectado en el escáner! 🧾 Procesando validación...")
+    try:
+        tipo_mensaje = mensaje_info.get('type')
         
-        if numero_origen != NUMERO_JEFE:
-            # Actualizamos la última orden pendiente de este cliente
-            supabase.table('orders').update({
-                "status": "verificando_voucher", 
-                "voucher_image_id": image_id
-            }).eq('customer_phone', numero_origen).eq('status', 'pendiente_pago').execute()
-            
-            # Extraemos el token para enviárselo al Boss
-            orden_pendiente = supabase.table('orders').select('token_aprobacion').eq('customer_phone', numero_origen).eq('status', 'verificando_voucher').execute()
-            
-            if orden_pendiente.data:
-                token = orden_pendiente.data[0]['token_aprobacion']
-                enviar_mensaje(NUMERO_JEFE, f"💰 [REVISIÓN DE PAGO] \nEl cliente {nombre_usuario} acaba de enviar un voucher.\n\nPara confirmar escribe:\n#PAGO_OK {token}\n\nPara denegar escribe:\n#PAGO_FAIL {token}")
-                reenviar_imagen(NUMERO_JEFE, image_id, "Voucher recibido del cliente.")
-            else:
-                # Si el cliente manda una foto sin haber escrito "comprar" antes
-                enviar_mensaje(NUMERO_JEFE, f"⚠️ [IMAGEN HUÉRFANA] El cliente {nombre_usuario} envió esta foto, pero no tiene órdenes pendientes de pago en el sistema.")
-                reenviar_imagen(NUMERO_JEFE, image_id, "Imagen sin orden asociada.")
-        return
+        # Extraer el nombre de forma segura para evitar index/key errors
+        nombre_usuario = "Usuario"
+        contacts = cambios.get('contacts')
+        if contacts and len(contacts) > 0:
+            profile = contacts[0].get('profile')
+            if profile:
+                nombre_usuario = profile.get('name', "Usuario")
 
-    if tipo_mensaje != 'text':
-        return
-
-    texto_recibido = mensaje_info['text']['body'].strip()
-    texto_lower = texto_recibido.lower()
-
-    # ---------------------------------------------------------
-    # VÁLVULA DEL ADMINISTRADOR (EL BOSS)
-    # ---------------------------------------------------------
-    if numero_origen == NUMERO_JEFE:
-        
-        if texto_recibido == "#INICIAR_TURNO":
-            enviar_mensaje(NUMERO_JEFE, "✅ [SISTEMA] Ventana cuántica de 24 horas abierta.")
-        
-        elif texto_recibido.startswith("#NUEVA_PROMO:"):
-            texto_crudo = texto_recibido.replace("#NUEVA_PROMO:", "").strip()
-            enviar_mensaje(NUMERO_JEFE, "⚙️ [SISTEMA] Procesando texto con IA. Sintetizando catálogo...")
+        # ---------------------------------------------------------
+        # RADAR DE VOUCHERS (IMÁGENES)
+        # ---------------------------------------------------------
+        if tipo_mensaje == 'image':
+            image_id = mensaje_info['image']['id']
+            enviar_mensaje(numero_origen, "¡Comprobante detectado en el escáner! 🧾 Procesando validación...")
             
-            datos_json = procesar_promo_boss(texto_crudo)
-            
-            if datos_json:
-                try:
-                    supabase.table('campaigns').upsert({
-                        "nombre_producto": datos_json['nombre_producto'],
-                        "texto_crudo": texto_crudo,
-                        "datos_estructurados": datos_json,
-                        "is_active": True
-                    }).execute()
-                    enviar_mensaje(NUMERO_JEFE, f"✅ [ÉXITO] Producto '{datos_json['nombre_producto']}' guardado. Precio Oferta: S/{datos_json['precio_oferta']}")
-                except Exception as e:
-                    enviar_mensaje(NUMERO_JEFE, f"❌ [ERROR DB] Fallo al inyectar en Supabase: {e}")
-            else:
-                enviar_mensaje(NUMERO_JEFE, "❌ [ERROR IA] Los núcleos cognitivos colapsaron. Revisa tu saldo de API.")
-        
-        elif texto_recibido.startswith("#PAGO_OK "):
-            token = texto_recibido.replace("#PAGO_OK ", "").strip()
-            orden = supabase.table('orders').update({"status": "confirmado"}).eq('token_aprobacion', token).eq('status', 'verificando_voucher').execute()
-            
-            if orden.data:
-                celular_cliente = orden.data[0]['customer_phone']
-                enviar_mensaje(celular_cliente, "✅ ¡Pago confirmado exitosamente! 🎉 Por favor, envíanos tu dirección de entrega y distrito para programar el envío.")
-                enviar_mensaje(NUMERO_JEFE, f"✅ Orden {token} confirmada. El cliente ha sido notificado.")
-            else:
-                enviar_mensaje(NUMERO_JEFE, f"❌ No se encontró una orden pendiente con el token {token}.")
+            if numero_origen != NUMERO_JEFE:
+                # [NUEVO] Si el cliente manda su voucher, CANCELAMOS cualquier seguimiento de 30 mins
+                supabase.table('cola_mensajes').update({'is_processed': True}).eq('customer_phone', numero_origen).eq('is_processed', False).execute()
                 
-        elif texto_recibido.startswith("#PAGO_FAIL "):
-            token = texto_recibido.replace("#PAGO_FAIL ", "").strip()
-            orden = supabase.table('orders').update({"status": "denegado"}).eq('token_aprobacion', token).eq('status', 'verificando_voucher').execute()
-            
-            if orden.data:
-                celular_cliente = orden.data[0]['customer_phone']
-                enviar_mensaje(celular_cliente, "⚠️ Tuvimos un problema verificando tu captura de pago. Por favor, revisa tu transferencia o envíanos un comprobante más nítido.")
-                enviar_mensaje(NUMERO_JEFE, f"🚫 Orden {token} denegada. El cliente fue notificado.")
-            
-        elif texto_recibido.startswith("#PROMO_TERMINADA:"):
-            producto_a_borrar = texto_recibido.replace("#PROMO_TERMINADA:", "").strip()
-            try:
-                supabase.table('campaigns').update({"is_active": False}).ilike("nombre_producto", f"%{producto_a_borrar}%").execute()
-                enviar_mensaje(NUMERO_JEFE, f"🗑️ [SISTEMA] La campaña de '{producto_a_borrar}' ha sido desactivada (Soft Delete).")
-            except Exception as e:
-                enviar_mensaje(NUMERO_JEFE, f"❌ [ERROR DB] Fallo en la desactivación: {e}")
+                supabase.table('orders').update({
+                    "status": "verificando_voucher", 
+                    "voucher_image_id": image_id
+                }).eq('customer_phone', numero_origen).eq('status', 'pendiente_pago').execute()
                 
-        return
-
-    # ---------------------------------------------------------
-    # VÁLVULA DEL CLIENTE (EMBUDO CRM HÍBRIDO)
-    # ---------------------------------------------------------
-    if numero_origen != NUMERO_JEFE:
-        cliente_db = supabase.table('clientes').select('*').eq('phone', numero_origen).execute()
-        
-        # 1. Registro inicial / Cliente Nuevo (Fase 1)
-        if not cliente_db.data:
-            supabase.table('clientes').insert({'phone': numero_origen, 'name': nombre_usuario, 'fase_actual': 1}).execute()
-            
-            msg_bienvenida = (
-                f"¡Hola {nombre_usuario}! 👋 Bienvenido/a a {DATOS_EMPRESA['nombre_empresa']}.\n"
-                f"Respaldados con RUC: {DATOS_EMPRESA['ruc']} | Web: {DATOS_EMPRESA['web_url']}\n\n"
-                f"Gracias por escribirnos 😊. ¿Sobre qué producto deseas información?"
-            )
-            enviar_mensaje(numero_origen, msg_bienvenida)
-            return 
-            
-        else:
-            fase = cliente_db.data[0]['fase_actual']
-            supabase.table('clientes').update({'ultimo_mensaje_at': 'now()'}).eq('phone', numero_origen).execute()
-
-            # 2. La Transacción Estricta (Mecánica Pura)
-            if texto_lower.startswith("comprar "):
-                try:
-                    articulo = texto_lower.replace("comprar ", "").strip()
-                    token = numero_origen[-4:]
-                    
-                    supabase.table('orders').insert({
-                        "customer_phone": numero_origen, 
-                        "product_name": articulo, 
-                        "token_aprobacion": token
-                    }).execute()
-                    
-                    enviar_mensaje(numero_origen, f"📦 Separando tu: *{articulo}*.\nPor favor, Yapea al 999-999-999 y envíanos la *foto de la captura* por aquí para validar.")
-                    enviar_mensaje(NUMERO_JEFE, f"🔔 [NUEVA ORDEN - ESPERANDO PAGO]\nCliente: {nombre_usuario}\nProducto: {articulo}\nToken de validación: {token}")
+                orden_pendiente = supabase.table('orders').select('token_aprobacion').eq('customer_phone', numero_origen).eq('status', 'verificando_voucher').execute()
                 
-                except Exception as e:
-                    print(f"❌ [ERROR FATAL DE TRANSACCIÓN]: {e}")
-                    enviar_mensaje(numero_origen, "⚠️ Ocurrió una anomalía temporal en la matriz de pedidos. ¡Por favor, intenta escribir tu pedido una vez más!")
-
-            # 3. El Córtex de Ventas Persuasivo (LLM + JSON)
-            else:
-                promo_activa = supabase.table('campaigns').select('*').eq('is_active', True).execute()
-                
-                if promo_activa.data:
-                    datos_producto = promo_activa.data[0]['datos_estructurados']
-                    nombre_prod = promo_activa.data[0]['nombre_producto']
-                    
-                    # Invocamos el cerebro de ventas persuasivo para analizar el contexto
-                    respuesta_ia = generar_respuesta_ventas(texto_recibido, fase, datos_producto, nombre_prod)
-                    
-                    if respuesta_ia:
-                        nueva_fase = respuesta_ia.get("fase_siguiente", fase)
-                        mensaje_ia = respuesta_ia.get("mensaje_convincente", "¡Hola! ¿En qué te puedo ayudar hoy?")
-                        
-                        # Guardamos el avance del estado del cliente en el CRM
-                        supabase.table('clientes').update({'fase_actual': nueva_fase}).eq('phone', numero_origen).execute()
-                        
-                        # El bot ejecuta el mensaje persuasivo cargado de emojis
-                        enviar_mensaje(numero_origen, mensaje_ia)
-                    else:
-                        # Red de Seguridad de Rescate si la inferencia JSON falla
-                        enviar_mensaje(numero_origen, generar_respuesta_rescate(texto_recibido))
+                if orden_pendiente.data:
+                    token = orden_pendiente.data[0]['token_aprobacion']
+                    enviar_mensaje(NUMERO_JEFE, f"💰 [REVISIÓN DE PAGO] \nEl cliente {nombre_usuario} acaba de enviar un voucher.\n\nPara confirmar escribe:\n#PAGO_OK {token}\n\nPara denegar escribe:\n#PAGO_FAIL {token}")
+                    reenviar_imagen(NUMERO_JEFE, image_id, "Voucher recibido del cliente.")
                 else:
-                    enviar_mensaje(numero_origen, "En este momento estamos actualizando nuestro catálogo. ¡Vuelve en unos minutos!")
+                    enviar_mensaje(NUMERO_JEFE, f"⚠️ [IMAGEN HUÉRFANA] El cliente {nombre_usuario} envió esta foto, pero no tiene órdenes pendientes de pago en el sistema.")
+                    reenviar_imagen(NUMERO_JEFE, image_id, "Imagen sin orden asociada.")
+            return
+
+        if tipo_mensaje != 'text':
+            return
+
+        texto_recibido = mensaje_info['text']['body'].strip()
+        texto_lower = texto_recibido.lower()
+
+        # ---------------------------------------------------------
+        # VÁLVULA DEL ADMINISTRADOR (EL BOSS)
+        # ---------------------------------------------------------
+        if numero_origen == NUMERO_JEFE:
+            if texto_recibido == "#INICIAR_TURNO":
+                enviar_mensaje(NUMERO_JEFE, "✅ [SISTEMA] Ventana cuántica de 24 horas abierta.")
+            elif texto_recibido.startswith("#NUEVA_PROMO:"):
+                texto_crudo = texto_recibido.replace("#NUEVA_PROMO:", "").strip()
+                enviar_mensaje(NUMERO_JEFE, "⚙️ [SISTEMA] Procesando texto con IA. Sintetizando catálogo...")
+                datos_json = procesar_promo_boss(texto_crudo)
+                if datos_json:
+                    try:
+                        supabase.table('campaigns').upsert({
+                            "nombre_producto": datos_json['nombre_producto'],
+                            "texto_crudo": texto_crudo,
+                            "datos_estructurados": datos_json,
+                            "is_active": True
+                        }).execute()
+                        enviar_mensaje(NUMERO_JEFE, f"✅ [ÉXITO] Producto '{datos_json['nombre_producto']}' guardado. Precio Oferta: S/{datos_json['precio_oferta']}")
+                    except Exception as e:
+                        enviar_mensaje(NUMERO_JEFE, f"❌ [ERROR DB] Fallo al inyectar en Supabase: {e}")
+                else:
+                    enviar_mensaje(NUMERO_JEFE, "❌ [ERROR IA] Los núcleos cognitivos colapsaron. Revisa tu saldo de API.")
+            elif texto_recibido.startswith("#PAGO_OK "):
+                token = texto_recibido.replace("#PAGO_OK ", "").strip()
+                orden = supabase.table('orders').update({"status": "confirmado"}).eq('token_aprobacion', token).eq('status', 'verificando_voucher').execute()
+                if orden.data:
+                    celular_cliente = orden.data[0]['customer_phone']
+                    enviar_mensaje(celular_cliente, "✅ ¡Pago confirmado exitosamente! 🎉 Por favor, envíanos tu dirección de entrega y distrito para programar el envío.")
+                    enviar_mensaje(NUMERO_JEFE, f"✅ Orden {token} confirmada. El cliente ha sido notificado.")
+                else:
+                    enviar_mensaje(NUMERO_JEFE, f"❌ No se encontró una orden pendiente con el token {token}.")
+            elif texto_recibido.startswith("#PAGO_FAIL "):
+                token = texto_recibido.replace("#PAGO_FAIL ", "").strip()
+                orden = supabase.table('orders').update({"status": "denegado"}).eq('token_aprobacion', token).eq('status', 'verificando_voucher').execute()
+                if orden.data:
+                    celular_cliente = orden.data[0]['customer_phone']
+                    enviar_mensaje(celular_cliente, "⚠️ Tuvimos un problema verificando tu captura de pago. Por favor, revisa tu transferencia o envíanos un comprobante más nítido.")
+                    enviar_mensaje(NUMERO_JEFE, f"🚫 Orden {token} denegada. El cliente fue notificado.")
+            elif texto_recibido.startswith("#PROMO_TERMINADA:"):
+                producto_a_borrar = texto_recibido.replace("#PROMO_TERMINADA:", "").strip()
+                try:
+                    supabase.table('campaigns').update({"is_active": False}).ilike("nombre_producto", f"%{producto_a_borrar}%").execute()
+                    enviar_mensaje(NUMERO_JEFE, f"🗑️ [SISTEMA] La campaña de '{producto_a_borrar}' ha sido desactivada (Soft Delete).")
+                except Exception as e:
+                    enviar_mensaje(NUMERO_JEFE, f"❌ [ERROR DB] Fallo en la desactivación: {e}")
+            return
+
+        # ---------------------------------------------------------
+        # VÁLVULA DEL CLIENTE (EMBUDO CRM HÍBRIDO)
+        # ---------------------------------------------------------
+        if numero_origen != NUMERO_JEFE:
+            
+            # [NUEVO] ¡Regla de Oro! Si el cliente escribe, CANCELAMOS sus tareas de seguimiento pendientes
+            supabase.table('cola_mensajes').update({'is_processed': True}).eq('customer_phone', numero_origen).eq('is_processed', False).execute()
+            
+            cliente_db = supabase.table('clientes').select('*').eq('phone', numero_origen).execute()
+            fase_resultante = 1 # Variable para guardar en qué fase queda el cliente al final del script
+            
+            if not cliente_db.data:
+                supabase.table('clientes').insert({'phone': numero_origen, 'name': nombre_usuario, 'fase_actual': 1}).execute()
+                msg_bienvenida = (
+                    f"¡Hola {nombre_usuario}! 👋 Bienvenido/a a {DATOS_EMPRESA['nombre_empresa']}.\n"
+                    f"Respaldados con RUC: {DATOS_EMPRESA['ruc']} | Web: {DATOS_EMPRESA['web_url']}\n\n"
+                    f"Gracias por escribirnos 😊. ¿Sobre qué producto deseas información?"
+                )
+                enviar_mensaje(numero_origen, msg_bienvenida)
+                fase_resultante = 1
+                
+            else:
+                fase = cliente_db.data[0]['fase_actual']
+                supabase.table('clientes').update({'ultimo_mensaje_at': 'now()'}).eq('phone', numero_origen).execute()
+
+                if texto_lower.startswith("comprar "):
+                    try:
+                        articulo = texto_lower.replace("comprar ", "").strip()
+                        token = numero_origen[-4:]
+                        
+                        supabase.table('orders').insert({
+                            "customer_phone": numero_origen, "product_name": articulo, "token_aprobacion": token
+                        }).execute()
+                        
+                        enviar_mensaje(numero_origen, f"📦 Separando tu: *{articulo}*.\nPor favor, Yapea al 999-999-999 y envíanos la *foto de la captura* por aquí para validar.")
+                        enviar_mensaje(NUMERO_JEFE, f"🔔 [NUEVA ORDEN - ESPERANDO PAGO]\nCliente: {nombre_usuario}\nProducto: {articulo}\nToken de validación: {token}")
+                        fase_resultante = 5 # Fase completada, ya no necesita seguimiento
+                    except Exception as e:
+                        enviar_mensaje(numero_origen, "⚠️ Ocurrió una anomalía temporal en la matriz de pedidos. ¡Por favor, intenta escribir tu pedido una vez más!")
+                        fase_resultante = fase
+                else:
+                    promo_activa = supabase.table('campaigns').select('*').eq('is_active', True).execute()
                     
-                
-                
+                    if promo_activa.data:
+                        datos_producto = promo_activa.data[0]['datos_estructurados']
+                        nombre_prod = promo_activa.data[0]['nombre_producto']
+                        
+                        respuesta_ia = generar_respuesta_ventas(texto_recibido, fase, datos_producto, nombre_prod)
+                        
+                        if respuesta_ia:
+                            fase_resultante = respuesta_ia.get("fase_siguiente", fase)
+                            mensaje_ia = respuesta_ia.get("mensaje_convincente", "¡Hola! ¿En qué te puedo ayudar hoy?")
+                            supabase.table('clientes').update({'fase_actual': fase_resultante}).eq('phone', numero_origen).execute()
+                            enviar_mensaje(numero_origen, mensaje_ia)
+                        else:
+                            enviar_mensaje(numero_origen, generar_respuesta_rescate(texto_recibido))
+                            fase_resultante = fase
+                    else:
+                        enviar_mensaje(numero_origen, "En este momento estamos actualizando nuestro catálogo. ¡Vuelve en unos minutos!")
+                        fase_resultante = fase
+
+            # [NUEVO] REPROGRAMACIÓN AUTOMÁTICA DEL SEGUIMIENTO
+            # Si el cliente sigue en el embudo (fases 1 a 4) y no ha comprado aún (Fase 5), le ponemos el cronómetro de 30 mins
+            if fase_resultante < 5:
+                tiempo_ejecucion = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+                supabase.table('cola_mensajes').insert({
+                    'customer_phone': numero_origen,
+                    'fase_programada': fase_resultante,
+                    'ejecutar_en': tiempo_ejecucion
+                }).execute()
+    except Exception as e:
+        logger.error(f"⚠️ [ENRUTADOR MECÁNICO ERROR] Error procesando mensaje de {numero_origen}: {e}", exc_info=True)
+
 if __name__ == '__main__':
     app.run(port=5000)
