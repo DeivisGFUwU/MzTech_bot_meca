@@ -94,43 +94,46 @@ except Exception as e:
     DATOS_EMPRESA = {"nombre_empresa": "MzTech", "web_url": "[https://manzanotech.com/](https://manzanotech.com/)", "ruc": "20610576002", "fecha_fundacion": "2023-02-20"}
 
 # ==========================================
-# EL RELOJ CUÁNTICO (MOTOR ASÍNCRONO)
+# EL RELOJ CUÁNTICO CORREGIDO (MOTOR ASÍNCRONO)
 # ==========================================
 def motor_seguimiento_asincrono():
-    """Hilo infinito que vigila a los clientes inactivos y dispara el retargeting de 30 minutos."""
+    """Hilo infinito que vigila a los clientes inactivos con un regulador de tiempo estricto."""
     while True:
         try:
             ahora = datetime.now(timezone.utc).isoformat()
+            # Escaneamos si existen tareas listas para dispararse
             tareas = supabase.table('cola_mensajes').select('*').eq('is_processed', False).lte('ejecutar_en', ahora).execute()
             
-            for tarea in tareas.data:
-                telefono = tarea['customer_phone']
-                fase = tarea['fase_programada']
-                id_tarea = tarea['id']
-                
-                try:
-                    bloqueo = supabase.table('cola_mensajes').update({'is_processed': True}).eq('id', id_tarea).eq('is_processed', False).execute()
-                    if not bloqueo.data:
+            if tareas.data:
+                for tarea in tareas.data:
+                    telefono = tarea['customer_phone']
+                    fase = tarea['fase_programada']
+                    id_tarea = tarea['id']
+                    
+                    # Marcamos inmediatamente como procesado de forma atómica para evitar que otro hilo lo duplique
+                    try:
+                        bloqueo = supabase.table('cola_mensajes').update({'is_processed': True}).eq('id', id_tarea).eq('is_processed', False).execute()
+                        if not bloqueo.data:
+                            continue # Si no se modificó nada, otra instancia ya tomó la tarea
+                    except Exception as e:
+                        logger.error(f"⚠️ [RELOJ] Fallo al sellar tarea {id_tarea}: {e}")
                         continue
-                except Exception as e:
-                    logger.error(f"⚠️ [RELOJ CUÁNTICO] Error al intentar bloquear la tarea {id_tarea}: {e}")
-                    continue
-                
-                catalogo = supabase.table('campaigns').select('nombre_producto').eq('is_active', True).execute()
-                nombres_activos = [prod['nombre_producto'] for prod in catalogo.data] if catalogo.data else "nuestro catálogo completo"
-                
-                mensaje_retargeting = generar_respuesta_seguimiento(fase, nombres_activos)
-                if mensaje_retargeting:
-                    enviar_mensaje(telefono, mensaje_retargeting)
-                    logger.info(f"🎯 [RETARGETING] Mensaje asíncrono enviado a {telefono}")
-                
+                    
+                    # Solicitamos el catálogo activo a Supabase
+                    catalogo = supabase.table('campaigns').select('nombre_producto').eq('is_active', True).execute()
+                    nombres_activos = [prod['nombre_producto'] for prod in catalogo.data] if catalogo.data else "nuestro catálogo completo"
+                    
+                    # Invocamos el mensaje persuasivo de seguimiento
+                    mensaje_retargeting = generar_respuesta_seguimiento(fase, nombres_activos)
+                    if mensaje_retargeting:
+                        enviar_mensaje(telefono, mensaje_retargeting)
+                        logger.info(f"🎯 [RETARGETING] Mensaje asíncrono enviado con éxito a {telefono}")
+            
         except Exception as e:
             logger.error(f"⚠️ [RELOJ CUÁNTICO] Interferencia en el motor asíncrono: {e}")
             
-    time.sleep(60)
-
-hilo_reloj = threading.Thread(target=motor_seguimiento_asincrono, daemon=True)
-hilo_reloj.start()
+        # ¡CRÍTICO! El sleep DEBE estar dentro del while True para frenar el consumo de CPU y sockets
+        time.sleep(60)
 
 # ==========================================
 # VÁLVULA DE SUPERVIVENCIA (UPTIMEROBOT)
