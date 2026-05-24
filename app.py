@@ -14,7 +14,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from dotenv import load_dotenv
-# Importamos las funciones cognitivas
 from cerebro_ia import procesar_promo_boss, generar_respuesta_rescate, generar_respuesta_ventas, generar_respuesta_seguimiento
 
 # Configuración de Logging de producción
@@ -34,18 +33,18 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 NUMERO_JEFE = os.getenv("NUMERO_JEFE")
-WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET") # Secreto de la aplicación Meta para validar firmas
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET")
 
 # Configuración del Pool de Conexiones HTTP
 http_session = requests.Session()
 retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 http_session.mount("https://", HTTPAdapter(pool_connections=20, pool_maxsize=40, max_retries=retries))
 
-# Pool de Hilos para procesar webhooks
+# Pool de Hilos para procesar webhooks de manera controlada
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 webhook_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-# Limitadores de Tasa (Rate Limiters)
+# Limitadores de Tasa (Rate Limiters) thread-safe
 class InMemoryRateLimiter:
     def __init__(self, requests_limit, period_seconds):
         self.limit = requests_limit
@@ -63,9 +62,10 @@ class InMemoryRateLimiter:
             return False
 
 ip_rate_limiter = InMemoryRateLimiter(requests_limit=60, period_seconds=60)
-wa_rate_limiter = InMemoryRateLimiter(requests_limit=10, period_seconds=60)
+wa_rate_limiter = InMemoryRateLimiter(requests_limit=15, period_seconds=60)
 
 def verificar_firma_whatsapp(payload_bytes, signature_header):
+    """Verifica criptográficamente que el webhook provenga de Meta utilizando el App Secret."""
     if not WHATSAPP_APP_SECRET:
         logger.warning("🔒 [SEGURIDAD] WHATSAPP_APP_SECRET no está configurado. Omisión temporal de validación de firma.")
         return True
@@ -82,7 +82,7 @@ def verificar_firma_whatsapp(payload_bytes, signature_header):
     
     return hmac.compare_digest(signature, expected_signature)
 
-# Conexión a Supabase
+# Conexión a la Matriz de Datos
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 # --- EXTRACCIÓN DE LA MATRIZ DE AUTORIDAD ---
@@ -91,12 +91,13 @@ try:
     DATOS_EMPRESA = auth_data.data[0]
 except Exception as e:
     logger.error(f"⚠️ [ALERTA] Fallo al extraer datos de autoridad de Supabase: {e}")
-    DATOS_EMPRESA = {"nombre_empresa": "MzTech", "web_url": "https://manzanotech.com/", "ruc": "20610576002", "fecha_fundacion": "2023-02-20"}
+    DATOS_EMPRESA = {"nombre_empresa": "MzTech", "web_url": "[https://manzanotech.com/](https://manzanotech.com/)", "ruc": "20610576002", "fecha_fundacion": "2023-02-20"}
 
 # ==========================================
 # EL RELOJ CUÁNTICO (MOTOR ASÍNCRONO)
 # ==========================================
 def motor_seguimiento_asincrono():
+    """Hilo infinito que vigila a los clientes inactivos y dispara el retargeting de 30 minutos."""
     while True:
         try:
             ahora = datetime.now(timezone.utc).isoformat()
@@ -126,7 +127,7 @@ def motor_seguimiento_asincrono():
         except Exception as e:
             logger.error(f"⚠️ [RELOJ CUÁNTICO] Interferencia en el motor asíncrono: {e}")
             
-        time.sleep(60)
+    time.sleep(60)
 
 hilo_reloj = threading.Thread(target=motor_seguimiento_asincrono, daemon=True)
 hilo_reloj.start()
@@ -138,11 +139,13 @@ hilo_reloj.start()
 def mantener_vivo():
     ip_cliente = request.remote_addr or "unknown_ip"
     if not ip_rate_limiter.is_allowed(ip_cliente):
+        logger.warning(f"🚫 [RATE LIMIT] Peticiones IP excedidas para ping: {ip_cliente}")
         return jsonify({"error": "Demasiadas peticiones"}), 429
     try:
         supabase.table('campaigns').select('id').limit(1).execute()
         return "¡Reactor LarvaDev latiendo a 120 BPM!", 200
     except Exception as e:
+        logger.error(f"⚠️ [PING ERROR] Error al interactuar con base de datos: {e}")
         return "¡Reactor LarvaDev experimentando fallos de red!", 500
 
 # ==========================================
@@ -159,16 +162,20 @@ def webhook_whatsapp():
         ip_cliente = request.remote_addr or "unknown_ip"
         
         if not ip_rate_limiter.is_allowed(ip_cliente):
+            logger.warning(f"🚫 [RATE LIMIT] IP bloqueada temporalmente: {ip_cliente}")
             return jsonify({"error": "Demasiadas peticiones"}), 429
         
         raw_payload = request.get_data()
         signature = request.headers.get("X-Hub-Signature-256")
         if not verificar_firma_whatsapp(raw_payload, signature):
+            logger.warning(f"🔒 [SEGURIDAD] Firma de webhook inválida desde la IP: {ip_cliente}")
             return jsonify({"error": "Acceso denegado. Firma inválida."}), 401
         
         try:
             data = json.loads(raw_payload.decode('utf-8'))
-        except Exception:
+            logger.info(f"📥 [PAYLOAD RECIBIDO]: {json.dumps(data)}")
+        except Exception as e:
+            logger.error(f"⚠️ [JSON ERROR] Error de parseo en webhook desde IP {ip_cliente}: {e}")
             return jsonify({"error": "JSON malformado"}), 400
             
         try:
@@ -184,8 +191,10 @@ def webhook_whatsapp():
                         
                         if numero_origen:
                             if not wa_rate_limiter.is_allowed(numero_origen):
+                                logger.warning(f"🚫 [RATE LIMIT] Mensajes de WhatsApp excedidos para {numero_origen}. Ignorando.")
                                 return jsonify({"status": "rate_limited"}), 200
                             
+                            logger.info(f"🚀 [DESPACHADOR] Enrutando mensaje de {numero_origen} al executor.")
                             webhook_executor.submit(enrutador_mecanico, numero_origen, mensaje_info, cambios)
         except Exception as e:
             logger.error(f"⚠️ [WEBHOOK ERROR] Excepción al procesar webhook: {e}", exc_info=True)
@@ -193,22 +202,23 @@ def webhook_whatsapp():
         return jsonify({"status": "ok"}), 200
 
 # ==========================================
-# FUNCIONES DE TRANSMISIÓN
+# FUNCIONES DE TRANSMISIÓN (BRAZOS ROBÓTICOS)
 # ==========================================
 def enviar_mensaje(numero_destino, texto):
-    url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
+    url = f"[https://graph.facebook.com/v25.0/](https://graph.facebook.com/v25.0/){PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": numero_destino, "type": "text", "text": {"body": texto}}
     try:
         respuesta = http_session.post(url, headers=headers, json=payload, timeout=5)
         if respuesta.status_code == 200:
             return True
+        logger.error(f"❌ [WHATSAPP API] Error al enviar mensaje: {respuesta.status_code} - {respuesta.text}")
     except Exception as e:
         logger.error(f"❌ [WHATSAPP API] Excepción al enviar mensaje a {numero_destino}: {e}")
     return False
 
 def reenviar_imagen(numero_destino, image_id, caption):
-    url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
+    url = f"[https://graph.facebook.com/v25.0/](https://graph.facebook.com/v25.0/){PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp", "to": numero_destino, "type": "image",
@@ -218,6 +228,7 @@ def reenviar_imagen(numero_destino, image_id, caption):
         respuesta = http_session.post(url, headers=headers, json=payload, timeout=5)
         if respuesta.status_code == 200:
             return True
+        logger.error(f"❌ [WHATSAPP API] Error al reenviar imagen: {respuesta.status_code} - {respuesta.text}")
     except Exception as e:
         logger.error(f"❌ [WHATSAPP API] Excepción al reenviar imagen a {numero_destino}: {e}")
     return False
@@ -236,7 +247,9 @@ def enrutador_mecanico(numero_origen, mensaje_info, cambios):
             if profile:
                 nombre_usuario = profile.get('name', "Usuario")
 
+        # ---------------------------------------------------------
         # RADAR DE VOUCHERS (IMÁGENES)
+        # ---------------------------------------------------------
         if tipo_mensaje == 'image':
             image_id = mensaje_info['image']['id']
             enviar_mensaje(numero_origen, "¡Comprobante detectado en el escáner! 🧾 Procesando validación...")
@@ -265,7 +278,9 @@ def enrutador_mecanico(numero_origen, mensaje_info, cambios):
         texto_recibido = mensaje_info['text']['body'].strip()
         texto_lower = texto_recibido.lower()
 
-        # VÁLVULA DEL ADMINISTRADOR
+        # ---------------------------------------------------------
+        # VÁLVULA DEL ADMINISTRADOR (EL BOSS)
+        # ---------------------------------------------------------
         if numero_origen == NUMERO_JEFE:
             if texto_recibido == "#INICIAR_TURNO":
                 enviar_mensaje(NUMERO_JEFE, "✅ [SISTEMA] Ventana cuántica de 24 horas abierta.")
@@ -311,9 +326,10 @@ def enrutador_mecanico(numero_origen, mensaje_info, cambios):
                     enviar_mensaje(NUMERO_JEFE, f"❌ [ERROR DB] Fallo en la desactivación: {e}")
             return
 
-        # VÁLVULA DEL CLIENTE (HÍBRIDA + AUTO-CIERRE)
+        # ---------------------------------------------------------
+        # VÁLVULA DEL CLIENTE (EMBUDO CRM HÍBRIDO)
+        # ---------------------------------------------------------
         if numero_origen != NUMERO_JEFE:
-            
             supabase.table('cola_mensajes').update({'is_processed': True}).eq('customer_phone', numero_origen).eq('is_processed', False).execute()
             
             cliente_db = supabase.table('clientes').select('*').eq('phone', numero_origen).execute()
@@ -362,7 +378,6 @@ def enrutador_mecanico(numero_origen, mensaje_info, cambios):
                             fase_resultante = respuesta_ia.get("fase_siguiente", fase)
                             intencion = respuesta_ia.get("intencion_detectada", "").lower()
                             
-                            # ¡MAGIA REINYECTADA! Auto-cierre si el LLM detecta intención de comprar
                             if fase_resultante == 5 or "comprar" in intencion:
                                 try:
                                     token = numero_origen[-4:]

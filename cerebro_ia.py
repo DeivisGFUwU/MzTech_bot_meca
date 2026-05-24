@@ -34,7 +34,6 @@ def limpiar_y_cargar_json(texto):
         return None
     texto_limpio = texto.strip()
     if texto_limpio.startswith("```"):
-        # Remover bloques markdown
         lineas = texto_limpio.splitlines()
         if lineas[0].startswith("```json") or lineas[0].startswith("```"):
             lineas = lineas[1:]
@@ -70,7 +69,6 @@ def ejecutar_inferencia_cuantica(prompt_text, forzar_json=True):
                     parsed = limpiar_y_cargar_json(respuesta.text)
                     if parsed is not None:
                         return parsed
-                    # Si no pudimos parsear el JSON, reintentamos o fallamos al secundario
                     print(f"⚠️ [NÚCLEO 3.1] Respuesta no era JSON válido en intento {intento + 1}")
                 else:
                     return respuesta.text.strip()
@@ -131,27 +129,28 @@ def generar_respuesta_rescate(texto_cliente):
     return ejecutar_inferencia_cuantica(prompt_rescate, forzar_json=False)
 
 def generar_respuesta_ventas(texto_cliente, fase_actual, datos_producto, nombre_prod):
-    """Córtex de Ventas Persuasivo: Lee el contexto y decide la siguiente fase (ahora con auto-cierre)."""
+    """Córtex de Ventas Persuasivo: Lee el contexto, decide la fase y maneja el auto-cierre con concisión."""
     prompt_ventas = f"""
     Eres el vendedor estrella de MzTech.
     
-    REGLAS ESTRICTAS:
-    1. MONEDA OFICIAL: Los precios siempre se dan en Soles Peruanos (S/ o PEN).
-    2. CONCISIÓN EXTREMA: Sé muy breve y persuasivo. Usa emojis.
-    3. PODER DE CIERRE: Si el cliente muestra una intención CLARA y directa de querer comprar ahora mismo (ej. "los quiero", "ok los compro", "dámelos", "quiero uno"), NO le pidas que escriba ningún comando. Simplemente debes asignar "fase_siguiente": 5 y en "intencion_detectada" escribe la palabra exacta "comprar".
+    REGLAS ESTRICTAS DE RESPUESTA:
+    1. MONEDA OFICIAL: Los precios siempre se dan en Soles Peruanos (S/ o PEN). NUNCA uses dólares ni símbolos de otra moneda como euros (€).
+    2. CONCISIÓN EXTREMA: No hables demasiado. Si es la Fase 1 o 2, responde con 1 o 2 oraciones breves. Evita los párrafos largos. Responde directo al grano.
+    3. PERSUASIÓN: Usa emojis con moderación. 
+    4. PODER DE CIERRE: Si el cliente muestra una intención CLARA y directa de querer comprar ahora mismo (ej. "los quiero", "ok los compro", "dámelos", "quiero uno", "hola quiero comprar los airpods pro"), NO le pidas que escriba ningún comando. Simplemente debes asignar "fase_siguiente": 5 y en "intencion_detectada" escribe la palabra exacta "comprar".
     
     ESTADO DEL SISTEMA:
-    - Fase actual del embudo: FASE {fase_actual}
+    - Fase actual del embudo: FASE {fase_actual} (1:Saludo, 2:Interés, 3:Precio, 4:Objeciones, 5:Cierre).
     - Producto Activo: {nombre_prod}
-    - Datos Técnicos: {json.dumps(datos_producto, ensure_ascii=False)}
+    - Datos Técnicos: {json.dumps(datos_producto, ensure_ascii=False)} (No inventes datos que no estén aquí).
     
     MENSAJE DEL CLIENTE: "{texto_cliente}"
     
-    Devuelve ESTRICTAMENTE un JSON:
+    Devuelve ESTRICTAMENTE un JSON con esta estructura:
     {{
       "intencion_detectada": "breve intencion (usa 'comprar' si acepta llevarlo)",
       "fase_siguiente": numero (del 1 al 5),
-      "mensaje_convincente": "tu respuesta persuasiva aquí (déjalo vacío si la intención es 'comprar')"
+      "mensaje_convincente": "tu respuesta persuasiva y muy concisa aquí (déjalo vacío si la intención es 'comprar')"
     }}
     """
     return ejecutar_inferencia_cuantica(prompt_ventas, forzar_json=True)
@@ -170,6 +169,4 @@ def generar_respuesta_seguimiento(fase_actual, catalogo_nombres):
     3. Pregúntale sutilmente si le quedó alguna duda con el producto que estaba viendo.
     4. Opcional: Menciónale de forma natural que también tenemos otros modelos en stock ({catalogo_nombres}) por si busca otra cosa.
     """
-    
-    # Aquí NO forzamos JSON, queremos el texto puro para enviarlo directo
     return ejecutar_inferencia_cuantica(prompt_seguimiento, forzar_json=False)
