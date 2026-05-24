@@ -208,7 +208,7 @@ def webhook_whatsapp():
 # FUNCIONES DE TRANSMISIÓN (BRAZOS ROBÓTICOS)
 # ==========================================
 def enviar_mensaje(numero_destino, texto):
-    url = f"[https://graph.facebook.com/v25.0/](https://graph.facebook.com/v25.0/){PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": numero_destino, "type": "text", "text": {"body": texto}}
     try:
@@ -221,7 +221,7 @@ def enviar_mensaje(numero_destino, texto):
     return False
 
 def reenviar_imagen(numero_destino, image_id, caption):
-    url = f"[https://graph.facebook.com/v25.0/](https://graph.facebook.com/v25.0/){PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp", "to": numero_destino, "type": "image",
